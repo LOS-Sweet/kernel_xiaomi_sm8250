@@ -199,6 +199,7 @@ struct dsi_display {
 	const char *display_type;
 	struct list_head list;
 	bool is_cont_splash_enabled;
+	bool is_prim_display;
 	bool sw_te_using_wd;
 	struct mutex display_lock;
 	int disp_te_gpio;
@@ -750,8 +751,9 @@ int dsi_display_hbm_set_disp_param(struct drm_connector *connector,
 int dsi_display_esd_irq_ctrl(struct dsi_display *display,
 		bool enable);
 
-struct dsi_display *get_main_display(void);
 #ifdef CONFIG_OSSFOD
+struct dsi_display *get_main_display(void);
+
 void dsi_display_set_fod_ui(struct dsi_display *display, bool status);
 #endif
 

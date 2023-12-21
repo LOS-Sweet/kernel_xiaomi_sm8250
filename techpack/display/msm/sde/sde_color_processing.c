@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  */
 
@@ -210,23 +211,8 @@ static struct sde_kms *get_kms(struct drm_crtc *crtc)
 static void update_pu_feature_enable(struct sde_crtc *sde_crtc,
 		u32 feature, bool enable)
 {
-	struct drm_crtc *crtc;
-	struct sde_crtc_state *sde_crtc_state;
-
 	if (!sde_crtc || feature > SDE_CP_CRTC_MAX_PU_FEATURES) {
 		DRM_ERROR("invalid args feature %d\n", feature);
-		return;
-	}
-
-	crtc = &(sde_crtc->base);
-	if (!crtc) {
-		DRM_ERROR("invalid crtc pointer\n");
-		return;
-	}
-
-	sde_crtc_state = to_sde_crtc_state(crtc->state);
-	if (!sde_crtc_state) {
-		DRM_ERROR("invalid sde_crtc_state pointer\n");
 		return;
 	}
 
@@ -234,13 +220,6 @@ static void update_pu_feature_enable(struct sde_crtc *sde_crtc,
 		sde_crtc->cp_pu_feature_mask |= BIT(feature);
 	else
 		sde_crtc->cp_pu_feature_mask &= ~BIT(feature);
-
-	/* clear cached ROI list when feature is disabled */
-	if ((sde_crtc->cp_pu_feature_mask == 0) &&
-		(sde_crtc->cached_user_roi_list.num_rects != 0)) {
-		memset(&sde_crtc->cached_user_roi_list, 0,
-				sizeof(struct msm_roi_list));
-	}
 }
 
 static int set_dspp_vlut_feature(struct sde_hw_dspp *hw_dspp,
@@ -4037,7 +4016,7 @@ void sde_cp_crtc_enable(struct drm_crtc *drm_crtc)
 	if (!num_mixers)
 		return;
 	mutex_lock(&crtc->crtc_cp_lock);
-	info = kzalloc(sizeof(struct sde_kms_info), GFP_KERNEL);
+	info = vzalloc(sizeof(struct sde_kms_info));
 	if (info) {
 		for (i = 0; i < ARRAY_SIZE(dspp_cap_update_func); i++)
 			dspp_cap_update_func[i](crtc, info);
@@ -4046,7 +4025,7 @@ void sde_cp_crtc_enable(struct drm_crtc *drm_crtc)
 			info->data, SDE_KMS_INFO_DATALEN(info),
 			CRTC_PROP_DSPP_INFO);
 	}
-	kfree(info);
+	vfree(info);
 	mutex_unlock(&crtc->crtc_cp_lock);
 }
 
@@ -4061,12 +4040,12 @@ void sde_cp_crtc_disable(struct drm_crtc *drm_crtc)
 	}
 	crtc = to_sde_crtc(drm_crtc);
 	mutex_lock(&crtc->crtc_cp_lock);
-	info = kzalloc(sizeof(struct sde_kms_info), GFP_KERNEL);
+	info = vzalloc(sizeof(struct sde_kms_info));
 	if (info)
 		msm_property_set_blob(&crtc->property_info,
 				&crtc->dspp_blob_info,
 			info->data, SDE_KMS_INFO_DATALEN(info),
 			CRTC_PROP_DSPP_INFO);
 	mutex_unlock(&crtc->crtc_cp_lock);
-	kfree(info);
+	vfree(info);
 }
