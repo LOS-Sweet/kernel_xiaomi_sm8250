@@ -2351,6 +2351,8 @@ static int _sde_encoder_rc_kickoff(struct drm_encoder *drm_enc,
 	/* cancel delayed off work, if any */
 	_sde_encoder_rc_cancel_delayed(sde_enc, sw_event);
 
+	msm_idle_set_state(drm_enc, true);
+
 	mutex_lock(&sde_enc->rc_lock);
 
 	/* return if the resource control is already in ON state */
@@ -2465,6 +2467,8 @@ static int _sde_encoder_rc_frame_done(struct drm_encoder *drm_enc,
 		idle_pc_duration = max(4 * frame_time_ms, min_duration);
 		idle_pc_duration = min(idle_pc_duration, max_duration);
 	}
+
+	msm_idle_set_state(drm_enc, false);
 
 	if (!autorefresh_enabled)
 		kthread_mod_delayed_work(
@@ -4698,7 +4702,7 @@ static void sde_encoder_touch_notify_work_handler(struct kthread_work *work)
 	if (c_bridge)
 		dsi_display = c_bridge->display;
 
-	if (dsi_display && dsi_display->panel
+	if (dsi_display && dsi_display->is_prim_display && dsi_display->panel
 		&& dsi_display->panel->mi_cfg.smart_fps_restore) {
 		if (dsi_display->panel->mi_cfg.smart_fps_support && fm_stat.enabled) {
 			calc_fps(0, (int)true);
@@ -5096,6 +5100,8 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error)
 	struct dsi_display_mode adj_mode;
 	ktime_t wakeup_time;
 	unsigned int i;
+	struct sde_kms *sde_kms = NULL;
+	struct msm_drm_private *priv = NULL;
 
 	if (!drm_enc) {
 		SDE_ERROR("invalid encoder\n");
@@ -5146,6 +5152,11 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error)
 		&& adj_mode.dsi_mode_flags & DSI_MODE_FLAG_VRR) {
 		dsi_panel_match_fps_pen_setting(dsi_display->panel, &adj_mode);
 		mutex_unlock(&dsi_display->panel->panel_lock);
+	}
+
+	priv = sde_enc->base.dev->dev_private;
+	if (priv != NULL) {
+		sde_kms = to_sde_kms(priv->kms);
 	}
 
 	SDE_ATRACE_END("encoder_kickoff");
@@ -6483,4 +6494,29 @@ void sde_encoder_save_vsync_info(struct sde_encoder_phys *phys_enc)
 
 	calc_vsync->vsync_count++;
 	calc_vsync->vsync_count %= MAX_VSYNC_COUNT;
+}
+
+void sde_encoder_trigger_early_wakeup(struct drm_encoder *drm_enc)
+{
+	struct sde_encoder_virt *sde_enc = NULL;
+	struct msm_drm_private *priv = NULL;
+
+	priv = drm_enc->dev->dev_private;
+	sde_enc = to_sde_encoder_virt(drm_enc);
+	if (!sde_enc->crtc || (sde_enc->crtc->index
+			>= ARRAY_SIZE(priv->disp_thread))) {
+		SDE_DEBUG_ENC(sde_enc,
+			"invalid cached CRTC: %d or crtc index: %d\n",
+			sde_enc->crtc == NULL,
+			sde_enc->crtc ? sde_enc->crtc->index : -EINVAL);
+		return;
+	}
+
+	if (sde_enc->rc_state == SDE_ENC_RC_STATE_IDLE ||
+		sde_enc->rc_state == SDE_ENC_RC_STATE_ON) {
+		SDE_ATRACE_BEGIN("sde_encoder_resource_control");
+		sde_encoder_resource_control(drm_enc,
+					SDE_ENC_RC_EVENT_EARLY_WAKEUP);
+		SDE_ATRACE_END("sde_encoder_resource_control");
+	}
 }

@@ -55,8 +55,6 @@
 	ipc_log_string(_mtp_ipc_log, "%s: " fmt,  __func__, ##__VA_ARGS__)
 #endif
 
-#define MTP_RX_BUFFER_INIT_SIZE    1048576
-#define MTP_TX_BUFFER_INIT_SIZE    1048576
 #define MTP_BULK_BUFFER_SIZE       16384
 #define INTR_BUFFER_SIZE           28
 #define MAX_INST_NAME_LEN          40
@@ -93,10 +91,10 @@
 
 #define MAX_ITERATION		100
 
-unsigned int mtp_rx_req_len = MTP_RX_BUFFER_INIT_SIZE;
+unsigned int mtp_rx_req_len = MTP_BULK_BUFFER_SIZE;
 module_param(mtp_rx_req_len, uint, 0644);
 
-unsigned int mtp_tx_req_len = MTP_TX_BUFFER_INIT_SIZE;
+unsigned int mtp_tx_req_len = MTP_BULK_BUFFER_SIZE;
 module_param(mtp_tx_req_len, uint, 0644);
 
 unsigned int mtp_tx_reqs = MTP_TX_REQ_MAX;
@@ -354,6 +352,20 @@ struct mtp_ext_config_desc {
 	struct mtp_ext_config_desc_function    function;
 };
 
+static struct mtp_ext_config_desc mtp_ext_config_desc = {
+	.header = {
+		.dwLength = __constant_cpu_to_le32(sizeof(mtp_ext_config_desc)),
+		.bcdVersion = __constant_cpu_to_le16(0x0100),
+		.wIndex = __constant_cpu_to_le16(4),
+		.bCount = 1,
+	},
+	.function = {
+		.bFirstInterfaceNumber = 0,
+		.bInterfaceCount = 1,
+		.compatibleID = { 'M', 'T', 'P' },
+	},
+};
+
 struct mtp_device_status {
 	__le16	wLength;
 	__le16	wCode;
@@ -530,6 +542,9 @@ static int mtp_create_bulk_endpoints(struct mtp_dev *dev,
 	dev->ep_intr = ep;
 
 retry_tx_alloc:
+	if (mtp_tx_req_len > MTP_BULK_BUFFER_SIZE)
+		mtp_tx_reqs = 4;
+
 	/* now allocate requests for our endpoints */
 	for (i = 0; i < mtp_tx_reqs; i++) {
 		req = mtp_request_new(dev->ep_in, mtp_tx_req_len);
@@ -752,8 +767,8 @@ static ssize_t mtp_write(struct file *fp, const char __user *buf,
 			break;
 		}
 
-		if (count > mtp_tx_req_len)
-			xfer = mtp_tx_req_len;
+		if (count > MTP_BULK_BUFFER_SIZE)
+			xfer = MTP_BULK_BUFFER_SIZE;
 		else
 			xfer = count;
 		if (xfer && copy_from_user(req->buf, buf, xfer)) {
@@ -811,6 +826,11 @@ static void send_file_work(struct work_struct *data)
 	offset = dev->xfer_file_offset;
 	count = dev->xfer_file_length;
 
+	if (count < 0) {
+		dev->xfer_result = -EINVAL;
+		return;
+	}
+
 	mtp_log("(%lld %lld)\n", offset, count);
 
 	if (dev->xfer_send_header) {
@@ -847,8 +867,8 @@ static void send_file_work(struct work_struct *data)
 			break;
 		}
 
-		if (count > mtp_tx_req_len)
-			xfer = mtp_tx_req_len;
+		if (count > MTP_BULK_BUFFER_SIZE)
+			xfer = MTP_BULK_BUFFER_SIZE;
 		else
 			xfer = count;
 
@@ -924,6 +944,11 @@ static void receive_file_work(struct work_struct *data)
 	filp = dev->xfer_file;
 	offset = dev->xfer_file_offset;
 	count = dev->xfer_file_length;
+
+	if (count < 0) {
+		dev->xfer_result = -EINVAL;
+		return;
+	}
 
 	mtp_log("(%lld)\n", count);
 	if (!IS_ALIGNED(count, dev->ep_out->maxpacket))
@@ -1314,7 +1339,20 @@ static int mtp_ctrlrequest(struct usb_composite_dev *cdev,
 		mtp_log("vendor request: %d index: %d value: %d length: %d\n",
 			ctrl->bRequest, w_index, w_value, w_length);
 
-		value = -EOPNOTSUPP;
+		if (ctrl->bRequest == 1
+				&& (ctrl->bRequestType & USB_DIR_IN)
+				&& (w_index == 4 || w_index == 5)) {
+			value = (w_length < sizeof(mtp_ext_config_desc) ?
+					w_length : sizeof(mtp_ext_config_desc));
+			memcpy(cdev->req->buf, &mtp_ext_config_desc, value);
+
+			/* update compatibleID if PTP */
+			if (dev->function.fs_descriptors == fs_ptp_descs) {
+				struct mtp_ext_config_desc *d = cdev->req->buf;
+
+				d->function.compatibleID[0] = 'P';
+			}
+		}
 	} else if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
 		mtp_log("class request: %d index: %d value: %d length: %d\n",
 			ctrl->bRequest, w_index, w_value, w_length);
@@ -1793,10 +1831,6 @@ struct usb_function_instance *alloc_inst_mtp_ptp(bool mtp_config)
 		return ERR_PTR(-ENOMEM);
 	fi_mtp->func_inst.set_inst_name = mtp_set_inst_name;
 	fi_mtp->func_inst.free_func_inst = mtp_free_inst;
-	if (mtp_config)
-		memcpy(fi_mtp->mtp_ext_compat_id, "MTP", 3);
-	else
-		memcpy(fi_mtp->mtp_ext_compat_id, "PTP", 3);
 
 	fi_mtp->mtp_os_desc.ext_compat_id = fi_mtp->mtp_ext_compat_id;
 	INIT_LIST_HEAD(&fi_mtp->mtp_os_desc.ext_prop);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
  */
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
@@ -22,6 +24,7 @@
 #include "dsi_display.h"
 #include "dsi_panel_mi.h"
 #include "clone_cooling_device.h"
+#include "mi_disp_lhbm.h"
 
 #define BL_NODE_NAME_SIZE 32
 #define HDR10_PLUS_VSIF_TYPE_CODE      0x81
@@ -90,15 +93,19 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 
 	c_conn = bl_get_data(bd);
 	display = (struct dsi_display *) c_conn->display;
-	if (brightness > display->panel->bl_config.bl_max_level)
-		brightness = display->panel->bl_config.bl_max_level;
+	if (brightness > display->panel->bl_config.brightness_max_level)
+		brightness = display->panel->bl_config.brightness_max_level;
 
-	/* map UI brightness into driver backlight level with rounding */
-	bl_lvl = mult_frac(brightness, display->panel->bl_config.bl_max_level,
-			display->panel->bl_config.brightness_max_level);
+	if (brightness) {
+		int bl_min = display->panel->bl_config.bl_min_level ? : 1;
+		int bl_range = display->panel->bl_config.bl_max_level - bl_min;
 
-	if (!bl_lvl && brightness)
-		bl_lvl = 1;
+		/* map UI brightness into driver backlight level rounding it */
+		bl_lvl = bl_min + DIV_ROUND_CLOSEST((brightness - 1) * bl_range,
+			display->panel->bl_config.brightness_max_level - 1);
+	} else {
+		bl_lvl = 0;
+	}
 
 	if (!c_conn->allow_bl_update) {
 		c_conn->unset_bl_level = bl_lvl;
@@ -798,7 +805,6 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 	mutex_lock(&display->panel->panel_lock);
 	dsi_panel_set_fod_hbm(display->panel, status);
 	mutex_unlock(&display->panel->panel_lock);
-
 	dsi_display_set_fod_ui(display, status);
 }
 #endif
@@ -830,15 +836,76 @@ void sde_crtc_fod_ui_ready(struct dsi_display *display, int type, int value)
 
 	if (type == 2) /* ICON */
 	{
-		if (value == 0)
-			display->panel->mi_cfg.fod_ui_ready &= ~0x02;
-		else if (value == 1)
-			display->panel->mi_cfg.fod_ui_ready |= 0x02;
+		if (display->panel->mi_cfg.local_hbm_enabled) {
+			if (value == 0)
+				display->panel->mi_cfg.fod_ui_ready &= ~0x07;
+			else if (value == 1) {
+				if (display->panel->mi_cfg.lhbm_target == LOCAL_LHBM_TARGET_BRIGHTNESS_WHITE_110NIT)
+					display->panel->mi_cfg.fod_ui_ready |= 0x07;
+				else if (display->panel->mi_cfg.lhbm_target == LOCAL_LHBM_TARGET_BRIGHTNESS_WHITE_1000NIT
+					|| display->panel->mi_cfg.lhbm_target == LOCAL_LHBM_TARGET_BRIGHTNESS_GREEN_500NIT)
+					display->panel->mi_cfg.fod_ui_ready |= 0x03;
+			}
+
+		} else {
+			if (value == 0)
+				display->panel->mi_cfg.fod_ui_ready &= ~0x02;
+			else if (value == 1)
+				display->panel->mi_cfg.fod_ui_ready |= 0x02;
+		}
 
 	}
 
 	SDE_INFO("fod_ui_ready notify=%d", display->panel->mi_cfg.fod_ui_ready);
 	sysfs_notify(&display->drm_conn->kdev->kobj, NULL, "fod_ui_ready");
+}
+
+int mi_sde_connector_gir_fence(struct drm_connector *connector)
+{
+	int rc = 0;
+	struct sde_connector *c_conn;
+	struct dsi_display *dsi_display;
+	struct dsi_panel_mi_cfg *mi_cfg;
+
+	if (!connector) {
+		SDE_ERROR("invalid connector ptr\n");
+		return -EINVAL;
+	}
+
+	c_conn = to_sde_connector(connector);
+
+	if (c_conn->connector_type != DRM_MODE_CONNECTOR_DSI)
+		return 0;
+
+	dsi_display = (struct dsi_display *) c_conn->display;
+	if (!dsi_display || !dsi_display->panel) {
+		SDE_ERROR("invalid display/panel ptr\n");
+		return -EINVAL;
+	}
+
+	if (strncmp(dsi_display->display_type, "primary", 7))
+		return -EINVAL;
+
+	mi_cfg = &dsi_display->panel->mi_cfg;
+	mutex_lock(&dsi_display->panel->panel_lock);
+	if (mi_cfg->request_gir_status == true && mi_cfg->gir_enabled == false) {
+		SDE_ATRACE_BEGIN("DISP_FEATURE_GIR_ON");
+		SDE_INFO("mi-dsi-panel: gir on\n");
+		dsi_panel_tx_cmd_set(dsi_display->panel, DSI_CMD_SET_MI_GIR_ON);
+		sde_encoder_wait_for_event(c_conn->encoder,MSM_ENC_VBLANK);
+		SDE_ATRACE_END("DISP_FEATURE_GIR_ON");
+		mi_cfg->gir_enabled = true;
+	} else if (mi_cfg->request_gir_status == false && mi_cfg->gir_enabled == true) {
+		SDE_ATRACE_BEGIN("DISP_FEATURE_GIR_OFF");
+		SDE_INFO("mi-dsi-panel: gir off\n");
+		dsi_panel_tx_cmd_set(dsi_display->panel, DSI_CMD_SET_MI_GIR_OFF);
+		sde_encoder_wait_for_event(c_conn->encoder,MSM_ENC_VBLANK);
+		SDE_ATRACE_END("DISP_FEATURE_GIR_OFF");
+		mi_cfg->gir_enabled = false;
+	}
+	mutex_unlock(&dsi_display->panel->panel_lock);
+
+	return rc;
 }
 
 static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
@@ -857,6 +924,9 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 	bool icon;
 	static bool last_icon = false;
 #endif
+	bool anim;
+	static bool last_anim = false;
+
 	if (!connector) {
 		SDE_ERROR("invalid argument\n");
 		return -EINVAL;
@@ -997,6 +1067,17 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 	}
 	last_icon = icon;
 #endif
+
+	anim = c_conn->mi_dimlayer_state.mi_dimlayer_type & MI_LAYER_FOD_ANIM;
+	if (last_anim != anim) {
+		if (anim) {
+			mi_cfg->fod_anim_layer_enabled = true;
+		} else {
+			mi_cfg->fod_anim_layer_enabled = false;
+		}
+	}
+	last_anim = anim;
+
 	return rc;
 }
 
@@ -1102,6 +1183,8 @@ int sde_connector_pre_kickoff(struct drm_connector *connector)
 	params.hdr_meta = &c_state->hdr_meta;
 
 	SDE_EVT32_VERBOSE(connector->base.id);
+
+	mi_sde_connector_gir_fence(connector);
 
 	/* fingerprint hbm fence */
 	_sde_connector_mi_dimlayer_hbm_fence(connector);
@@ -1213,6 +1296,10 @@ void sde_connector_helper_bridge_enable(struct drm_connector *connector)
 		sde_encoder_wait_for_event(c_conn->encoder,
 				MSM_ENC_TX_COMPLETE);
 	c_conn->allow_bl_update = true;
+
+	if (display->panel->mi_cfg.pending_lhbm_state) {
+		mi_disp_set_fod_queue_work(1, false);
+	}
 
 	if (c_conn->bl_device) {
 		c_conn->bl_device->props.power = FB_BLANK_UNBLANK;
@@ -2249,7 +2336,7 @@ static ssize_t _sde_debugfs_conn_esd_test_write(struct file *file,
 	int power_mode;
 	char *input;
 	int rc = 0;
-	const char *sde_power_mode_str[] = {
+	const __maybe_unused char *sde_power_mode_str[] = {
 		[SDE_MODE_DPMS_ON] = "SDE_MODE_DPMS_ON",
 		[SDE_MODE_DPMS_LP1] = "SDE_MODE_DPMS_LP1",
 		[SDE_MODE_DPMS_LP2] = "SDE_MODE_DPMS_LP2",
@@ -2676,7 +2763,7 @@ static irqreturn_t esd_err_irq_handle(int irq, void *data)
 	struct dsi_display *display = c_conn->display;
 	struct drm_event event;
 	int power_mode;
-	const char *sde_power_mode_str[] = {
+	const __maybe_unused char *sde_power_mode_str[] = {
 		[SDE_MODE_DPMS_ON] = "SDE_MODE_DPMS_ON",
 		[SDE_MODE_DPMS_LP1] = "SDE_MODE_DPMS_LP1",
 		[SDE_MODE_DPMS_LP2] = "SDE_MODE_DPMS_LP2",
@@ -2870,7 +2957,7 @@ int sde_connector_set_blob_data(struct drm_connector *conn,
 		return -EINVAL;
 	}
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = vzalloc(sizeof(*info));
 	if (!info)
 		return -ENOMEM;
 
@@ -2928,7 +3015,7 @@ int sde_connector_set_blob_data(struct drm_connector *conn,
 			SDE_KMS_INFO_DATALEN(info),
 			prop_id);
 exit:
-	kfree(info);
+	vfree(info);
 
 	return rc;
 }
